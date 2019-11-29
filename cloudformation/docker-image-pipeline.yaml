@@ -1,0 +1,335 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Creates Docker image and pushes to ECR
+
+Parameters: 
+  GitHubOwner:
+    Description: GitHub repository owner
+    Type: String
+    Default: adamabernathy
+
+  GitHubRepo:
+    Description: GitHub repository
+    Type: String
+    Default: python-ms-sql-docker-image
+
+  GitHubBranch:
+    Description: Source code branch to pull from
+    Type: String
+    Default: master
+
+  GitHubSecretArn:
+    Description: ARN of AWS Secret containing the GitHub OAuth Token
+    Type: String
+
+  GitHubTokenName:
+    Description: GitHub Automation Secret Name
+    Type: String
+    Default: GitHubAutomationToken
+
+  DockerImageName:
+    Description: Name of Docker image
+    Type: String
+
+  DaysToRetainUntaggedContainerImages:
+    Description: Days to keep untagged images in ECR
+    Type: String
+    Default: 7
+
+  MaxTaggedContainerImagesToRetain:
+    Description: Number of images to keep in ECR
+    Type: String
+    Default: 5
+
+Metadata:
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - Label:
+          default: "Source code settings"
+        Parameters: 
+          - GitHubOwner
+          - GitHubRepo
+          - GitHubBranch
+          - GitHubSecretArn
+          - GitHubTokenName
+      - Label:
+          default: "Docker & ECR settings"
+        Parameters:
+          - DockerImageName
+          - MaxTaggedContainerImagesToRetain
+
+Resources:
+  # Location of build artifacts
+  PipelineArtifactsBucket: 
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub "${AWS::Region}-${AWS::StackName}-artifacts"
+      AccessControl: Private
+
+  # Docker images
+  EcrRepository:
+    Type: "AWS::ECR::Repository"
+    Properties:
+      RepositoryName: !Ref DockerImageName
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub
+          - |
+            {
+              "rules": [
+                {
+                  "rulePriority": 1,
+                  "description": "Only keep untagged images for ${DaysToRetainUntaggedContainerImages} days",
+                  "selection": {
+                    "tagStatus": "untagged",
+                    "countType": "sinceImagePushed",
+                    "countUnit": "days",
+                    "countNumber": ${DaysToRetainUntaggedContainerImages}
+                  },
+                  "action": { "type": "expire" }
+                }
+              ]
+            }
+          - DaysToRetainUntaggedContainerImages: !Ref DaysToRetainUntaggedContainerImages
+      # Some IAM Rules
+      RepositoryPolicyText: |
+          {
+            "Version": "2008-10-17",
+            "Statement": [
+              {
+                "Sid": "AllowPull",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": [
+                  "ecr:GetDownloadUrlForLayer",
+                  "ecr:BatchGetImage",
+                  "ecr:BatchCheckLayerAvailability"
+                ]
+              }
+            ]
+          }
+
+  CodePipeline:
+    Type: "AWS::CodePipeline::Pipeline"
+    Properties:
+      Name: !Sub "${AWS::StackName}"
+      RoleArn: !GetAtt CodePipeLineRole.Arn
+      ArtifactStore:
+        Location: !Ref PipelineArtifactsBucket
+        Type: S3
+      Stages:
+        - Name: Source
+          Actions: 
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: 1
+              OutputArtifacts:
+                - Name: SourceCode
+              Configuration:
+                Owner: !Ref GitHubOwner
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Join ["", ["{{resolve:secretsmanager:", !Ref GitHubTokenName, "::::}}", ]]
+        - Name: Beta
+          Actions: 
+            - Name: CreateDockerContainer
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              InputArtifacts:
+                - Name: SourceCode
+              OutputArtifacts:
+                - Name: BuildArtifacts
+              Configuration:
+                ProjectName: !Ref CodeBuildDockerImage
+
+  CodeBuildDockerImage:
+    Type: "AWS::CodeBuild::Project"
+    Properties:
+      Name: !Sub "${AWS::StackName}-CodeBuild"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+        Name: artifacts
+      Source: 
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 10
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Type: LINUX_CONTAINER
+        Image: "aws/codebuild/standard:2.0"
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_REGION
+            Value: !Sub "${AWS::Region}"
+            Type: PLAINTEXT
+          - Name: AWS_ACCOUNT_ID
+            Type: PLAINTEXT
+            Value: !Sub "${AWS::AccountId}"
+          - Name: IMAGE_REPO_NAME
+            Type: PLAINTEXT
+            Value: !Ref DockerImageName
+          - Name: IMAGE_TAG
+            Type: PLAINTEXT
+            Value: "latest"
+
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                docker: 18
+
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - $(aws ecr get-login --no-include-email --region $AWS_REGION)
+                - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+                - echo "PROVIDERS_FILE_PATH" $PROVIDERS_FILE_PATH
+
+            build:
+              commands:
+                - echo Build started on `date`
+                - echo Building the Docker image...
+                - docker build
+                  --tag $IMAGE_REPO_NAME:$IMAGE_TAG
+                  --build-arg COMMIT_HASH=$COMMIT_HASH
+                  .
+                - docker tag
+                  $IMAGE_REPO_NAME:$IMAGE_TAG
+                  $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$COMMIT_HASH
+                - docker tag
+                  $IMAGE_REPO_NAME:$IMAGE_TAG
+                  $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo Pushing the Docker image...
+                - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$COMMIT_HASH
+                - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+
+  # -- IAM Roles --
+  CodeBuildRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "codebuild.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: /service-role/
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Resource:
+                  - !Sub "arn:aws:s3:::${PipelineArtifactsBucket}"
+                  - !Sub "arn:aws:s3:::${PipelineArtifactsBucket}/*"
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+
+              - Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${DockerImageName}"
+                Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:DescribeImages
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+              
+              - Resource: "*"
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+
+  CodePipeLineRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Resource:
+                  - !Sub "arn:aws:s3:::${PipelineArtifactsBucket}"
+                  - !Sub "arn:aws:s3:::${PipelineArtifactsBucket}/*"
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+
+              - Resource: !Ref GitHubSecretArn
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - ecr:DescribeImages
+
+Outputs:
+  EcrRepositoryUrl:
+    Description: Docker Image URL
+    Value: !Sub "${AWS::StackName}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}"
+
+  EcrRepositoryArn:
+    Description: Docker Image ARN
+    Value: !GetAtt EcrRepository.Arn
+
+  SourceRepository:
+    Description: Owner/Repository of source
+    Value: !Sub "${GitHubOwner}/${GitHubBranch}"
+
+  SourceBranch:
+    Description: Source code branch used in deployment
+    Value: !Ref GitHubBranch
+
+  PipelineArtifactsBucket:
+    Description: S3 bucket containing build artifacts
+    Value: !GetAtt PipelineArtifactsBucket.Arn
+
+  PipelineUrl:
+    Description: CodeBuild Pipeline
+    Value: !Sub "https://console.aws.amazon.com/codesuite/codepipeline/pipelines/${AWS::StackName}/view"
