@@ -6,10 +6,11 @@ LABEL \
     version="1.1.0" \
     description="One stop shop for Python and MS SQL Server interface"
 
-WORKDIR /app
+COPY LICENSE README.md /
 
 RUN \
     # Clean up source code
+    mv /README.md /Readme.md; \
     rm -fr /app/venv ; \
     # Install system packages
     apt-get update && apt-get install -y \
