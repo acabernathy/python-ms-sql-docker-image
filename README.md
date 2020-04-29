@@ -8,4 +8,4 @@ This base image provides Python 3.6 and Microsoft SQL Server client to build Pyt
 
 ## Licence
 
-(C) 2019 Adam C. Abernathy, LLC - All rights reserved.
+Copyright (c) 2019 Adam C. Abernathy, LLC - MIT License
